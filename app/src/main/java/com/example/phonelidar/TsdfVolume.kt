@@ -31,11 +31,12 @@ class TsdfVolume(
     private val blocks = HashMap<Long, Block>()
     private val dirtyChunks = HashSet<Long>()
     private val touched = HashSet<Long>()
+    private var frameCount = 0
 
     val truncation = voxelSize * 4f
     private val blockSize = voxelSize * BLOCK_DIM
-    private val maxWeight = 64f
-    private val minMeshWeight = 2f
+    private val maxWeight = 100f
+    private val minMeshWeight = 1.5f
 
     val blockCount: Int get() = blocks.size
     val isFull: Boolean get() = blocks.size >= maxBlocks
@@ -79,7 +80,18 @@ class TsdfVolume(
             }
         }
 
-        // 2. Update every voxel of those blocks by projecting it into the depth image.
+        // 2. Existing blocks that the camera now sees through are free space: integrating
+        // them carves away floating noise left by earlier bad measurements.
+        // Done every other frame: it visits every block, and carving needs no hurry.
+        if (++frameCount % 2 == 0) {
+            for ((key, block) in blocks) {
+                if (key !in touched && isInFreeSpace(key, f)) {
+                    if (integrateBlock(block, key, f)) markBlockDirty(key)
+                }
+            }
+        }
+
+        // 3. Update every voxel of the surface blocks by projecting it into the depth image.
         for (key in touched) {
             var block = blocks[key]
             if (block == null) {
@@ -89,6 +101,24 @@ class TsdfVolume(
             }
             if (integrateBlock(block, key, f)) markBlockDirty(key)
         }
+    }
+
+    /** True if the whole block lies in front of the observed surface along its view ray. */
+    private fun isInFreeSpace(key: Long, f: DepthFrame): Boolean {
+        val m = f.pose
+        val half = blockSize * 0.5f
+        val px = (unpackX(key) * blockSize + half) - m[12]
+        val py = (unpackY(key) * blockSize + half) - m[13]
+        val pz = (unpackZ(key) * blockSize + half) - m[14]
+        val camX = m[0] * px + m[1] * py + m[2] * pz
+        val camY = m[4] * px + m[5] * py + m[6] * pz
+        val zs = -(m[8] * px + m[9] * py + m[10] * pz)
+        if (zs < 0.3f) return false
+        val u = (f.fx * camX / zs + f.cx).toInt()
+        val v = (f.fy * -camY / zs + f.cy).toInt()
+        if (u < 0 || v < 0 || u >= f.width || v >= f.height) return false
+        val d = f.depth[v * f.width + u]
+        return d > 0f && zs + blockSize < d - truncation
     }
 
     private fun integrateBlock(block: Block, key: Long, f: DepthFrame): Boolean {
@@ -129,12 +159,14 @@ class TsdfVolume(
                     if (sdf < -trunc) continue
                     val t = if (sdf > trunc) 1f else sdf / trunc
 
+                    // Depth error grows with distance squared, so near readings count more.
+                    val wObs = (1f / (d * d)).coerceIn(0.2f, 1f)
                     val i = (z * BLOCK_DIM + y) * BLOCK_DIM + x
                     val wOld = weight[i]
-                    tsdf[i] = (tsdf[i] * wOld + t) / (wOld + 1f)
-                    weight[i] = min(wOld + 1f, maxWeight)
+                    tsdf[i] = (tsdf[i] * wOld + t * wObs) / (wOld + wObs)
+                    weight[i] = min(wOld + wObs, maxWeight)
                     if (sdf < trunc * 0.5f) {
-                        color[i] = blendColor(color[i], f.color[pix], wOld)
+                        color[i] = blendColor(color[i], f.color[pix], wOld / wObs)
                     }
                     changed = true
                 }
@@ -201,6 +233,12 @@ class TsdfVolume(
     private val gTsdf = FloatArray(G * G * G)
     private val gWeight = FloatArray(G * G * G)
     private val gColor = IntArray(G * G * G)
+    private val rTsdf = FloatArray(R * R * R)
+    private val rWeight = FloatArray(R * R * R)
+    private val rColor = IntArray(R * R * R)
+    private val num = FloatArray(R * R * R)
+    private val den = FloatArray(R * R * R)
+    private val tmp = FloatArray(R * R * R)
     private val cellVertex = IntArray(C * C * C)
     private val pos = FloatList()
     private val nrm = FloatList()
@@ -212,7 +250,8 @@ class TsdfVolume(
         val baseX = unpackX(key) * CHUNK_VOXELS - 1
         val baseY = unpackY(key) * CHUNK_VOXELS - 1
         val baseZ = unpackZ(key) * CHUNK_VOXELS - 1
-        if (!gather(baseX, baseY, baseZ)) return null
+        if (!gather(baseX - BORDER, baseY - BORDER, baseZ - BORDER)) return null
+        smooth()
 
         pos.clear(); nrm.clear(); col.clear(); idx.clear()
         val vs = voxelSize
@@ -347,27 +386,27 @@ class TsdfVolume(
         return 0.5f * sqrt(cx * cx + cy * cy + cz * cz)
     }
 
-    /** Copies the voxels of the chunk plus a 1-voxel border into the local grid. */
+    /** Copies the voxels of the chunk plus a border into the raw grid. */
     private fun gather(baseX: Int, baseY: Int, baseZ: Int): Boolean {
-        gWeight.fill(0f)
+        rWeight.fill(0f)
         var any = false
-        for (bz in (baseZ shr 3)..((baseZ + G - 1) shr 3)) {
-            for (by in (baseY shr 3)..((baseY + G - 1) shr 3)) {
-                for (bx in (baseX shr 3)..((baseX + G - 1) shr 3)) {
+        for (bz in (baseZ shr 3)..((baseZ + R - 1) shr 3)) {
+            for (by in (baseY shr 3)..((baseY + R - 1) shr 3)) {
+                for (bx in (baseX shr 3)..((baseX + R - 1) shr 3)) {
                     val block = blocks[pack(bx, by, bz)] ?: continue
                     any = true
-                    val x0 = max(baseX, bx * BLOCK_DIM); val x1 = min(baseX + G, bx * BLOCK_DIM + BLOCK_DIM)
-                    val y0 = max(baseY, by * BLOCK_DIM); val y1 = min(baseY + G, by * BLOCK_DIM + BLOCK_DIM)
-                    val z0 = max(baseZ, bz * BLOCK_DIM); val z1 = min(baseZ + G, bz * BLOCK_DIM + BLOCK_DIM)
+                    val x0 = max(baseX, bx * BLOCK_DIM); val x1 = min(baseX + R, bx * BLOCK_DIM + BLOCK_DIM)
+                    val y0 = max(baseY, by * BLOCK_DIM); val y1 = min(baseY + R, by * BLOCK_DIM + BLOCK_DIM)
+                    val z0 = max(baseZ, bz * BLOCK_DIM); val z1 = min(baseZ + R, bz * BLOCK_DIM + BLOCK_DIM)
                     for (gz in z0 until z1) {
                         for (gy in y0 until y1) {
                             var bi = ((gz - bz * BLOCK_DIM) * BLOCK_DIM + (gy - by * BLOCK_DIM)) * BLOCK_DIM +
                                 (x0 - bx * BLOCK_DIM)
-                            var li = ((gz - baseZ) * G + (gy - baseY)) * G + (x0 - baseX)
+                            var li = ((gz - baseZ) * R + (gy - baseY)) * R + (x0 - baseX)
                             for (gx in x0 until x1) {
-                                gTsdf[li] = block.tsdf[bi]
-                                gWeight[li] = block.weight[bi]
-                                gColor[li] = block.color[bi]
+                                rTsdf[li] = block.tsdf[bi]
+                                rWeight[li] = block.weight[bi]
+                                rColor[li] = block.color[bi]
                                 bi++
                                 li++
                             }
@@ -377,6 +416,53 @@ class TsdfVolume(
             }
         }
         return any
+    }
+
+    /**
+     * Weighted Gaussian-like blur ([1,4,6,4,1] per axis) of the raw grid into the meshing
+     * grid. Averaging only observed voxels smooths away depth noise without growing the
+     * surface into unobserved space.
+     */
+    private fun smooth() {
+        val n = R * R * R
+        for (i in 0 until n) {
+            val w = rWeight[i]
+            num[i] = rTsdf[i] * w
+            den[i] = w
+        }
+        blurAxis(num, 1)
+        blurAxis(num, R)
+        blurAxis(num, R * R)
+        blurAxis(den, 1)
+        blurAxis(den, R)
+        blurAxis(den, R * R)
+        for (k in 0 until G) {
+            for (j in 0 until G) {
+                var gi = (k * G + j) * G
+                var ri = ((k + BORDER) * R + (j + BORDER)) * R + BORDER
+                for (i in 0 until G) {
+                    val w = rWeight[ri]
+                    gWeight[gi] = w
+                    gTsdf[gi] = if (den[ri] > 0f) num[ri] / den[ri] else rTsdf[ri]
+                    gColor[gi] = rColor[ri]
+                    gi++
+                    ri++
+                }
+            }
+        }
+    }
+
+    private fun blurAxis(a: FloatArray, stride: Int) {
+        val n = R * R * R
+        val lo = 2 * stride
+        val hi = n - 2 * stride
+        for (i in lo until hi) {
+            tmp[i] = (a[i - 2 * stride] + 4f * a[i - stride] + 6f * a[i] +
+                4f * a[i + stride] + a[i + 2 * stride]) * (1f / 16f)
+        }
+        // Values that wrap across rows are only ever read inside the cropped interior,
+        // where every tap is a true neighbour.
+        System.arraycopy(tmp, lo, a, lo, hi - lo)
     }
 
     private fun buildMesh(key: Long, area: Float): ChunkMesh {
@@ -434,6 +520,10 @@ class TsdfVolume(
         // Local meshing grid: the chunk's voxels plus one voxel on every side.
         private const val G = CHUNK_VOXELS + 2
         private const val C = G - 1
+
+        // Raw grid gathered for smoothing: meshing grid plus the blur radius on every side.
+        private const val BORDER = 2
+        private const val R = G + 2 * BORDER
 
         // Cube corners are numbered c = x + 2y + 4z; these are the 12 edges.
         private val EDGES = intArrayOf(

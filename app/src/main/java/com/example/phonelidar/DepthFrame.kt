@@ -17,4 +17,31 @@ class DepthFrame(
     val cx: Float,
     val cy: Float,
     val pose: FloatArray,
-)
+) {
+    companion object {
+        /**
+         * Drops pixels on depth discontinuities. Smoothed depth blends foreground and
+         * background there, producing "flying" points that smear object edges.
+         */
+        fun removeEdges(depth: FloatArray, w: Int, h: Int, relThreshold: Float = 0.08f): FloatArray {
+            val out = FloatArray(w * h)
+            for (v in 1 until h - 1) {
+                for (u in 1 until w - 1) {
+                    val i = v * w + u
+                    val d = depth[i]
+                    if (d <= 0f) continue
+                    val limit = d * relThreshold
+                    if (jump(d, depth[i - 1], limit) || jump(d, depth[i + 1], limit) ||
+                        jump(d, depth[i - w], limit) || jump(d, depth[i + w], limit)
+                    ) {
+                        continue
+                    }
+                    out[i] = d
+                }
+            }
+            return out
+        }
+
+        private fun jump(d: Float, n: Float, limit: Float): Boolean = n > 0f && kotlin.math.abs(d - n) > limit
+    }
+}

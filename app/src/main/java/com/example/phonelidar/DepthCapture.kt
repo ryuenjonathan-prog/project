@@ -8,33 +8,40 @@ import java.nio.ByteOrder
 import kotlin.math.abs
 
 /**
- * Copies ARCore raw depth (plus confidence and camera color) out of a [Frame] into a
- * [DepthFrame]. Runs on the GL thread, so it only does cheap per-pixel work.
+ * Copies ARCore depth (plus camera color) out of a [Frame] into a [DepthFrame]. Runs on the
+ * GL thread, so it only does cheap per-pixel work.
+ *
+ * Uses ARCore's full depth (dense, temporally smoothed) when available, which gives much
+ * flatter surfaces than raw depth; falls back to raw depth filtered by confidence.
  */
 class DepthCapture {
 
     var minConfidence = 100
     var minDepthMeters = 0.25f
-    var maxDepthMeters = 4.5f
+    var maxDepthMeters = 3.5f
 
     private var lastDepthTimestamp = 0L
 
     /** Returns a new frame, or null if no new depth image is available. */
-    fun capture(frame: Frame): DepthFrame? {
+    fun capture(frame: Frame, useFullDepth: Boolean): DepthFrame? {
         val depth = try {
-            frame.acquireRawDepthImage16Bits()
+            if (useFullDepth) frame.acquireDepthImage16Bits() else frame.acquireRawDepthImage16Bits()
         } catch (e: NotYetAvailableException) {
             return null
         }
         depth.use {
             if (depth.timestamp == lastDepthTimestamp) return null
             lastDepthTimestamp = depth.timestamp
-            val confidence = try {
-                frame.acquireRawDepthConfidenceImage()
-            } catch (e: NotYetAvailableException) {
-                return null
+            val confidence = if (useFullDepth) {
+                null
+            } else {
+                try {
+                    frame.acquireRawDepthConfidenceImage()
+                } catch (e: NotYetAvailableException) {
+                    return null
+                }
             }
-            confidence.use {
+            try {
                 val color = try {
                     frame.acquireCameraImage()
                 } catch (e: NotYetAvailableException) {
@@ -45,11 +52,13 @@ class DepthCapture {
                 } finally {
                     color?.close()
                 }
+            } finally {
+                confidence?.close()
             }
         }
     }
 
-    private fun convert(frame: Frame, depth: Image, confidence: Image, color: Image?): DepthFrame {
+    private fun convert(frame: Frame, depth: Image, confidence: Image?, color: Image?): DepthFrame {
         val camera = frame.camera
         val w = depth.width
         val h = depth.height
@@ -70,24 +79,37 @@ class DepthCapture {
 
         val depthPlane = depth.planes[0]
         val depthBuf = depthPlane.buffer.order(ByteOrder.LITTLE_ENDIAN)
-        val confPlane = confidence.planes[0]
-        val confBuf = confPlane.buffer
+        val confPlane = confidence?.planes?.get(0)
+        val confBuf = confPlane?.buffer
         val sampler = color?.let { ColorSampler(it, camera.imageIntrinsics) }
 
-        val meters = FloatArray(w * h)
-        val colors = IntArray(w * h)
+        val raw = FloatArray(w * h)
         for (v in 0 until h) {
             for (u in 0 until w) {
-                val conf = confBuf.get(v * confPlane.rowStride + u * confPlane.pixelStride).toInt() and 0xFF
-                if (conf < minConfidence) continue
+                if (confPlane != null && confBuf != null) {
+                    val conf = confBuf.get(v * confPlane.rowStride + u * confPlane.pixelStride).toInt() and 0xFF
+                    if (conf < minConfidence) continue
+                }
                 val mm = depthBuf.getShort(v * depthPlane.rowStride + u * depthPlane.pixelStride)
                     .toInt() and 0xFFFF
                 val d = mm * 0.001f
                 if (d < minDepthMeters || d > maxDepthMeters) continue
-                val i = v * w + u
-                meters[i] = d
-                colors[i] = sampler?.sample((u - cx) * d / fx, (v - cy) * d / fy, d) ?: DEFAULT_COLOR
+                raw[v * w + u] = d
             }
+        }
+
+        val meters = DepthFrame.removeEdges(raw, w, h)
+        val colors = IntArray(w * h)
+        if (sampler != null) {
+            for (i in 0 until w * h) {
+                val d = meters[i]
+                if (d <= 0f) continue
+                val u = i % w
+                val v = i / w
+                colors[i] = sampler.sample((u - cx) * d / fx, (v - cy) * d / fy, d)
+            }
+        } else {
+            colors.fill(DEFAULT_COLOR)
         }
         return DepthFrame(w, h, meters, colors, fx, fy, cx, cy, pose)
     }

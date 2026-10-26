@@ -37,6 +37,7 @@ class ScanRenderer(
     @Volatile var view3d = false
     @Volatile var style = MeshRenderer.Style.NORMALS
     @Volatile var reframeRequested = true
+    @Volatile var useFullDepth = true
 
     private val background = BackgroundRenderer()
     private val meshRenderer = MeshRenderer()
@@ -110,7 +111,7 @@ class ScanRenderer(
         val tracking = camera.trackingState == TrackingState.TRACKING
         if (tracking && scanning && !worker.isBusy && !worker.isFull) {
             try {
-                depthCapture.capture(frame)?.let { worker.submit(it) }
+                depthCapture.capture(frame, useFullDepth)?.let { worker.submit(it) }
             } catch (e: Exception) {
                 Log.e(TAG, "Depth capture failed", e)
             }

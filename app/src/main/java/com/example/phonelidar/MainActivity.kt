@@ -456,6 +456,7 @@ class MainActivity : Activity() {
 
         val config = Config(s)
         config.setDepthMode(depthMode)
+        renderer.useFullDepth = depthMode == Config.DepthMode.AUTOMATIC
         config.setFocusMode(Config.FocusMode.AUTO)
         config.setPlaneFindingMode(Config.PlaneFindingMode.DISABLED)
         config.setLightEstimationMode(Config.LightEstimationMode.DISABLED)
@@ -465,9 +466,10 @@ class MainActivity : Activity() {
         return s
     }
 
+    // Full (smoothed) depth needs AUTOMATIC; raw-only is the fallback.
     private fun pickDepthMode(s: Session): Config.DepthMode? = when {
-        s.isDepthModeSupported(Config.DepthMode.RAW_DEPTH_ONLY) -> Config.DepthMode.RAW_DEPTH_ONLY
         s.isDepthModeSupported(Config.DepthMode.AUTOMATIC) -> Config.DepthMode.AUTOMATIC
+        s.isDepthModeSupported(Config.DepthMode.RAW_DEPTH_ONLY) -> Config.DepthMode.RAW_DEPTH_ONLY
         else -> null
     }
 
