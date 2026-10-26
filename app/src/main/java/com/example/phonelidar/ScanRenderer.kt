@@ -19,6 +19,7 @@ import javax.microedition.khronos.opengles.GL10
  */
 class ScanRenderer(
     private val worker: ReconstructionWorker,
+    private val keyframes: KeyframeCollector,
     private val orbit: OrbitCamera,
     private val displayRotation: () -> Int,
     private val onStats: (Stats) -> Unit,
@@ -111,11 +112,21 @@ class ScanRenderer(
         countCameraFps(frame.timestamp)
 
         val tracking = camera.trackingState == TrackingState.TRACKING
-        if (tracking && scanning && !worker.isBusy && !worker.isFull) {
+        if (tracking) keyframes.updateMotion(frame)
+        // Depth from a fast-turning phone is smeared; skip it.
+        val steady = keyframes.angularSpeed < MAX_DEPTH_ANGULAR_SPEED
+        if (tracking && scanning && steady && !worker.isBusy && !worker.isFull) {
             try {
                 depthCapture.capture(frame, useFullDepth)?.let { worker.submit(it) }
             } catch (e: Exception) {
                 Log.e(TAG, "Depth capture failed", e)
+            }
+        }
+        if (tracking && scanning) {
+            try {
+                keyframes.maybeCapture(frame)
+            } catch (e: Exception) {
+                Log.e(TAG, "Keyframe capture failed", e)
             }
         }
 
@@ -196,5 +207,6 @@ class ScanRenderer(
         private const val TAG = "ScanRenderer"
         private const val OVERLAY_ALPHA = 0.6f
         private const val PLANES_INTERVAL_MS = 500L
+        private const val MAX_DEPTH_ANGULAR_SPEED = 1.2f
     }
 }

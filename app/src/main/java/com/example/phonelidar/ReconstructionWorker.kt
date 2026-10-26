@@ -3,6 +3,7 @@ package com.example.phonelidar
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import android.util.Log
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -12,12 +13,16 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * While scanning, the published meshes are the live per-chunk meshes. When scanning stops,
  * [finalizeModel] replaces them with one cleaned-up model (plane snapping, island removal,
- * smoothing); resuming the scan switches back to the live chunks.
+ * smoothing, photo textures from [keyframes]); resuming the scan switches back to the
+ * live chunks.
  */
-class ReconstructionWorker {
+class ReconstructionWorker(private val keyframes: KeyframeCollector) {
 
-    /** A replaced chunk mesh; [mesh] == null removes the chunk, [CLEAR] removes everything. */
-    class MeshUpdate(val key: Long, val mesh: ChunkMesh?)
+    /**
+     * A replaced chunk mesh; [mesh] == null removes the chunk, [CLEAR] removes everything.
+     * [textured] carries the textured final model.
+     */
+    class MeshUpdate(val key: Long, val mesh: ChunkMesh?, val textured: TexturedMesh? = null)
 
     private val thread = HandlerThread("reconstruction").apply { start() }
     private val handler = Handler(thread.looper)
@@ -28,6 +33,7 @@ class ReconstructionWorker {
     private var chunkTriangles = 0
     private var chunkArea = 0f
     private var finalMesh: ChunkMesh? = null
+    private var finalTextured: TexturedMesh? = null
     private var finalStale = true
     private var showingFinal = false
 
@@ -80,6 +86,7 @@ class ReconstructionWorker {
             volume.clear()
             meshes.clear()
             finalMesh = null
+            finalTextured = null
             finalStale = true
             showingFinal = false
             chunkTriangles = 0
@@ -92,10 +99,10 @@ class ReconstructionWorker {
     }
 
     /** Hands the finished model to [block] on the worker thread. */
-    fun withFinalMesh(block: (List<ChunkMesh>) -> Unit) {
+    fun withFinalModel(block: (FinalModel) -> Unit) {
         handler.post {
             if (finalStale || finalMesh == null) buildFinal()
-            block(finalMesh?.let { listOf(it) } ?: meshes.values.toList())
+            block(FinalModel(finalMesh?.let { listOf(it) } ?: meshes.values.toList(), finalTextured))
         }
     }
 
@@ -103,7 +110,21 @@ class ReconstructionWorker {
         // Re-mesh everything so all chunks use the latest (most complete) planes.
         for (key in volume.allChunkKeys()) volume.markChunkDirty(key)
         remesh(Long.MAX_VALUE, publish = !showingFinal)
-        finalMesh = MeshPostProcessor.process(meshes.values.toList(), FINAL, planes)
+        val mesh = MeshPostProcessor.process(meshes.values.toList(), FINAL, planes)
+        finalMesh = mesh
+        finalTextured = null
+        val photos = keyframes.snapshot()
+        if (mesh != null && photos.isNotEmpty()) {
+            finalTextured = try {
+                TextureMapper.map(mesh, photos, BitmapAtlasCanvas())
+            } catch (e: OutOfMemoryError) {
+                Log.e(TAG, "Not enough memory for the texture atlas", e)
+                null
+            } catch (e: Exception) {
+                Log.e(TAG, "Texturing failed", e)
+                null
+            }
+        }
         finalStale = false
         if (showingFinal) showFinal()
     }
@@ -113,6 +134,7 @@ class ReconstructionWorker {
         showingFinal = true
         updates.add(MeshUpdate(CLEAR, null))
         updates.add(MeshUpdate(FINAL, mesh))
+        finalTextured?.let { updates.add(MeshUpdate(FINAL_TEXTURED, null, it)) }
         triangleCount = mesh.indexCount / 3
         surfaceArea = mesh.area
     }
@@ -162,6 +184,8 @@ class ReconstructionWorker {
     companion object {
         const val CLEAR = Long.MIN_VALUE
         const val FINAL = Long.MIN_VALUE + 1
+        const val FINAL_TEXTURED = Long.MIN_VALUE + 2
+        private const val TAG = "Reconstruction"
         private const val MESH_INTERVAL_MS = 250L
         private const val MESH_BUDGET_MS = 40L
     }

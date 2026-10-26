@@ -32,14 +32,13 @@ class DepthCapture {
         depth.use {
             if (depth.timestamp == lastDepthTimestamp) return null
             lastDepthTimestamp = depth.timestamp
-            val confidence = if (useFullDepth) {
+            // Raw-depth confidence is also available alongside full depth; there it only
+            // modulates weights instead of discarding pixels.
+            val confidence = try {
+                frame.acquireRawDepthConfidenceImage()
+            } catch (e: NotYetAvailableException) {
+                if (!useFullDepth) return null
                 null
-            } else {
-                try {
-                    frame.acquireRawDepthConfidenceImage()
-                } catch (e: NotYetAvailableException) {
-                    return null
-                }
             }
             try {
                 val color = try {
@@ -48,7 +47,7 @@ class DepthCapture {
                     null
                 }
                 try {
-                    return convert(frame, depth, confidence, color)
+                    return convert(frame, depth, confidence, color, useFullDepth)
                 } finally {
                     color?.close()
                 }
@@ -58,7 +57,13 @@ class DepthCapture {
         }
     }
 
-    private fun convert(frame: Frame, depth: Image, confidence: Image?, color: Image?): DepthFrame {
+    private fun convert(
+        frame: Frame,
+        depth: Image,
+        confidence: Image?,
+        color: Image?,
+        fullDepth: Boolean,
+    ): DepthFrame {
         val camera = frame.camera
         val w = depth.width
         val h = depth.height
@@ -79,8 +84,11 @@ class DepthCapture {
 
         val depthPlane = depth.planes[0]
         val depthBuf = depthPlane.buffer.order(ByteOrder.LITTLE_ENDIAN)
-        val confPlane = confidence?.planes?.get(0)
+        // Confidence must match the depth image pixel-for-pixel to be usable.
+        val confAligned = confidence != null && confidence.width == w && confidence.height == h
+        val confPlane = if (confAligned) confidence?.planes?.get(0) else null
         val confBuf = confPlane?.buffer
+        val confWeights = if (fullDepth && confPlane != null) FloatArray(w * h) else null
         val sampler = color?.let { ColorSampler(it, camera.imageIntrinsics) }
 
         val raw = FloatArray(w * h)
@@ -88,7 +96,13 @@ class DepthCapture {
             for (u in 0 until w) {
                 if (confPlane != null && confBuf != null) {
                     val conf = confBuf.get(v * confPlane.rowStride + u * confPlane.pixelStride).toInt() and 0xFF
-                    if (conf < minConfidence) continue
+                    if (confWeights != null) {
+                        confWeights[v * w + u] = 0.35f + 0.65f * conf / 255f
+                    } else if (conf < minConfidence) {
+                        continue
+                    }
+                } else if (!fullDepth) {
+                    continue
                 }
                 val mm = depthBuf.getShort(v * depthPlane.rowStride + u * depthPlane.pixelStride)
                     .toInt() and 0xFFFF
@@ -111,7 +125,8 @@ class DepthCapture {
         } else {
             colors.fill(DEFAULT_COLOR)
         }
-        return DepthFrame(w, h, meters, colors, fx, fy, cx, cy, pose)
+        val weights = DepthFrame.computeWeights(meters, w, h, fx, fy, cx, cy, confWeights)
+        return DepthFrame(w, h, meters, colors, fx, fy, cx, cy, pose, weights)
     }
 
     private fun pickIntrinsics(w: Int, h: Int, a: CameraIntrinsics, b: CameraIntrinsics): CameraIntrinsics {

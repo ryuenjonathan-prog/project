@@ -6,16 +6,38 @@ import java.io.OutputStreamWriter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+/** The finished scan: the mesh, plus a textured version when keyframes were available. */
+class FinalModel(val meshes: List<ChunkMesh>, val textured: TexturedMesh?)
+
+/** One output file of an export. */
+class ExportFile(val name: String, val mimeType: String, val write: (OutputStream) -> Unit)
+
 /** Export formats for the scanned mesh. */
 enum class MeshFormat(val extension: String, val mimeType: String, val title: String) {
-    GLB("glb", "model/gltf-binary", "GLB — 3D-модель (рекомендуется)"),
-    OBJ("obj", "model/obj", "OBJ — для Blender, 3ds Max, Unity"),
-    PLY("ply", "application/octet-stream", "PLY — сетка с цветами (MeshLab)");
+    GLB("glb", "model/gltf-binary", "GLB — 3D-модель с текстурой (рекомендуется)"),
+    OBJ("obj", "model/obj", "OBJ + MTL + JPG — для Blender, 3ds Max, Unity"),
+    PLY("ply", "application/octet-stream", "PLY — сетка с цветами вершин (MeshLab)");
 
-    fun write(out: OutputStream, meshes: List<ChunkMesh>) = when (this) {
-        GLB -> MeshWriters.writeGlb(out, meshes)
-        OBJ -> MeshWriters.writeObj(out, meshes)
-        PLY -> MeshWriters.writePly(out, meshes)
+    /** Files to write for [model]; the first one is the main file. */
+    fun files(baseName: String, model: FinalModel): List<ExportFile> {
+        val tm = model.textured
+        return when (this) {
+            GLB -> listOf(
+                ExportFile("$baseName.glb", mimeType) { out ->
+                    if (tm != null) MeshWriters.writeGlbTextured(out, tm) else MeshWriters.writeGlb(out, model.meshes)
+                },
+            )
+            OBJ -> if (tm != null) {
+                listOf(
+                    ExportFile("$baseName.obj", mimeType) { MeshWriters.writeObjTextured(it, tm, "$baseName.mtl") },
+                    ExportFile("$baseName.mtl", "text/plain") { MeshWriters.writeMtl(it, "$baseName.jpg") },
+                    ExportFile("$baseName.jpg", "image/jpeg") { it.write(tm.atlasJpeg) },
+                )
+            } else {
+                listOf(ExportFile("$baseName.obj", mimeType) { MeshWriters.writeObj(it, model.meshes) })
+            }
+            PLY -> listOf(ExportFile("$baseName.ply", mimeType) { MeshWriters.writePly(it, model.meshes) })
+        }
     }
 }
 
@@ -111,6 +133,117 @@ object MeshWriters {
             base += m.vertexCount
         }
         w.flush()
+    }
+
+    fun writeGlbTextured(out: OutputStream, m: TexturedMesh) {
+        val n = m.vertexCount
+        val posBytes = n * 12
+        val nrmBytes = n * 12
+        val uvBytes = n * 8
+        val colBytes = n * 4
+        val idxBytes = m.indexCount * 4
+        val imgBytes = m.atlasJpeg.size
+        val imgPadded = (imgBytes + 3) / 4 * 4
+        val o1 = posBytes
+        val o2 = o1 + nrmBytes
+        val o3 = o2 + uvBytes
+        val o4 = o3 + colBytes
+        val o5 = o4 + idxBytes
+        val binLength = o5 + imgPadded
+
+        val json = buildString {
+            append("{\"asset\":{\"version\":\"2.0\",\"generator\":\"Phone LiDAR\"},")
+            append("\"scene\":0,\"scenes\":[{\"nodes\":[0]}],")
+            append("\"nodes\":[{\"mesh\":0,\"name\":\"Scan\"}],")
+            append("\"meshes\":[{\"name\":\"Scan\",\"primitives\":[{")
+            append("\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2,\"COLOR_0\":3},")
+            append("\"indices\":4,\"material\":0,\"mode\":4}]}],")
+            append("\"materials\":[{\"name\":\"ScanTexture\",\"doubleSided\":true,")
+            append("\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},")
+            append("\"metallicFactor\":0,\"roughnessFactor\":1}}],")
+            append("\"textures\":[{\"sampler\":0,\"source\":0}],")
+            append("\"samplers\":[{\"magFilter\":9729,\"minFilter\":9987,\"wrapS\":33071,\"wrapT\":33071}],")
+            append("\"images\":[{\"bufferView\":5,\"mimeType\":\"image/jpeg\"}],")
+            append("\"buffers\":[{\"byteLength\":$binLength}],")
+            append("\"bufferViews\":[")
+            append("{\"buffer\":0,\"byteOffset\":0,\"byteLength\":$posBytes,\"target\":34962},")
+            append("{\"buffer\":0,\"byteOffset\":$o1,\"byteLength\":$nrmBytes,\"target\":34962},")
+            append("{\"buffer\":0,\"byteOffset\":$o2,\"byteLength\":$uvBytes,\"target\":34962},")
+            append("{\"buffer\":0,\"byteOffset\":$o3,\"byteLength\":$colBytes,\"target\":34962},")
+            append("{\"buffer\":0,\"byteOffset\":$o4,\"byteLength\":$idxBytes,\"target\":34963},")
+            append("{\"buffer\":0,\"byteOffset\":$o5,\"byteLength\":$imgBytes}],")
+            append("\"accessors\":[")
+            append("{\"bufferView\":0,\"componentType\":5126,\"count\":$n,\"type\":\"VEC3\",")
+            append("\"min\":[${m.min[0]},${m.min[1]},${m.min[2]}],\"max\":[${m.max[0]},${m.max[1]},${m.max[2]}]},")
+            append("{\"bufferView\":1,\"componentType\":5126,\"count\":$n,\"type\":\"VEC3\"},")
+            append("{\"bufferView\":2,\"componentType\":5126,\"count\":$n,\"type\":\"VEC2\"},")
+            append("{\"bufferView\":3,\"componentType\":5121,\"normalized\":true,\"count\":$n,\"type\":\"VEC4\"},")
+            append("{\"bufferView\":4,\"componentType\":5125,\"count\":${m.indexCount},\"type\":\"SCALAR\"}]}")
+        }
+        val jsonBytes = json.toByteArray(Charsets.UTF_8)
+        val jsonPadded = (jsonBytes.size + 3) / 4 * 4
+        val w = LeWriter(out)
+        w.int(0x46546C67)
+        w.int(2)
+        w.int(12 + 8 + jsonPadded + 8 + binLength)
+        w.int(jsonPadded)
+        w.int(0x4E4F534A)
+        w.bytes(jsonBytes)
+        repeat(jsonPadded - jsonBytes.size) { w.byte(0x20) }
+        w.int(binLength)
+        w.int(0x004E4942)
+        for (i in 0 until n * 3) w.float(m.positions[i])
+        for (i in 0 until n * 3) w.float(m.normals[i])
+        for (i in 0 until n * 2) w.float(m.uvs[i])
+        for (i in 0 until n) {
+            val c = m.colors[i]
+            w.byte(SRGB_TO_LINEAR[(c shr 16) and 0xFF])
+            w.byte(SRGB_TO_LINEAR[(c shr 8) and 0xFF])
+            w.byte(SRGB_TO_LINEAR[c and 0xFF])
+            w.byte(0xFF)
+        }
+        for (i in 0 until m.indexCount) w.int(m.indices[i])
+        w.bytes(m.atlasJpeg)
+        repeat(imgPadded - imgBytes) { w.byte(0) }
+        w.flush()
+    }
+
+    fun writeObjTextured(out: OutputStream, m: TexturedMesh, mtlName: String) {
+        val w = BufferedWriter(OutputStreamWriter(out, Charsets.US_ASCII), 1 shl 16)
+        w.write("# Phone LiDAR scan\nmtllib $mtlName\n")
+        for (i in 0 until m.vertexCount) {
+            w.write("v "); w.write(fmt(m.positions[i * 3])); w.write(" ")
+            w.write(fmt(m.positions[i * 3 + 1])); w.write(" "); w.write(fmt(m.positions[i * 3 + 2]))
+            val c = m.colors[i]
+            if (c != 0xFFFFFF) {
+                w.write(" "); w.write(fmt(((c shr 16) and 0xFF) / 255f))
+                w.write(" "); w.write(fmt(((c shr 8) and 0xFF) / 255f))
+                w.write(" "); w.write(fmt((c and 0xFF) / 255f))
+            }
+            w.write("\n")
+        }
+        for (i in 0 until m.vertexCount) {
+            // OBJ texture coordinates start at the bottom-left.
+            w.write("vt "); w.write(fmt(m.uvs[i * 2])); w.write(" "); w.write(fmt(1f - m.uvs[i * 2 + 1])); w.write("\n")
+        }
+        for (i in 0 until m.vertexCount) {
+            w.write("vn "); w.write(fmt(m.normals[i * 3])); w.write(" ")
+            w.write(fmt(m.normals[i * 3 + 1])); w.write(" "); w.write(fmt(m.normals[i * 3 + 2])); w.write("\n")
+        }
+        w.write("usemtl scan\n")
+        var i = 0
+        while (i < m.indexCount) {
+            val a = m.indices[i] + 1; val b = m.indices[i + 1] + 1; val c = m.indices[i + 2] + 1
+            w.write("f $a/$a/$a $b/$b/$b $c/$c/$c\n")
+            i += 3
+        }
+        w.flush()
+    }
+
+    fun writeMtl(out: OutputStream, textureName: String) {
+        val text = "newmtl scan\nKa 1 1 1\nKd 1 1 1\nKs 0 0 0\nillum 1\nmap_Kd $textureName\n"
+        out.write(text.toByteArray(Charsets.US_ASCII))
+        out.flush()
     }
 
     fun writePly(out: OutputStream, meshes: List<ChunkMesh>) {

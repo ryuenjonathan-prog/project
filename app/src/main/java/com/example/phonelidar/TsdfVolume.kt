@@ -160,7 +160,8 @@ class TsdfVolume(
                     val t = if (sdf > trunc) 1f else sdf / trunc
 
                     // Depth error grows with distance squared, so near readings count more.
-                    val wObs = (1f / (d * d)).coerceIn(0.2f, 1f)
+                    val wObs = (1f / (d * d)).coerceIn(0.2f, 1f) * f.weight[pix]
+                    if (wObs <= 0.01f) continue
                     val i = (z * BLOCK_DIM + y) * BLOCK_DIM + x
                     val wOld = weight[i]
                     tsdf[i] = (tsdf[i] * wOld + t * wObs) / (wOld + wObs)

@@ -1,6 +1,11 @@
 package com.example.phonelidar
 
+import android.graphics.BitmapFactory
 import android.opengl.GLES30
+import android.opengl.GLUtils
+import android.util.Log
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Queue
 
 /**
@@ -12,10 +17,23 @@ class MeshRenderer {
     enum class Style(val label: String) { COLOR("Цвет"), CLAY("Глина"), NORMALS("Нормали") }
 
     private class GpuChunk(val vbo: Int, val ibo: Int, val indexCount: Int)
+    private class GpuTextured(val vbo: Int, val ibo: Int, val texture: Int, val indexCount: Int)
 
     private val meshes = HashMap<Long, ChunkMesh>()
     private val gpu = HashMap<Long, GpuChunk>()
     private val pendingUpload = HashSet<Long>()
+
+    private var textured: TexturedMesh? = null
+    private var gpuTextured: GpuTextured? = null
+    private var texturedProgram = 0
+    private var tPosition = 0
+    private var tNormal = 0
+    private var tUv = 0
+    private var tColor = 0
+    private var tMvp = 0
+    private var tLight = 0
+    private var tAlpha = 0
+    private var tSampler = 0
 
     private var program = 0
     private var positionAttrib = 0
@@ -40,9 +58,19 @@ class MeshRenderer {
         lightUniform = GLES30.glGetUniformLocation(program, "u_LightDir")
         modeUniform = GLES30.glGetUniformLocation(program, "u_Mode")
         alphaUniform = GLES30.glGetUniformLocation(program, "u_Alpha")
+        texturedProgram = GlUtil.createProgram(TEXTURED_VERTEX_SHADER, TEXTURED_FRAGMENT_SHADER)
+        tPosition = GLES30.glGetAttribLocation(texturedProgram, "a_Position")
+        tNormal = GLES30.glGetAttribLocation(texturedProgram, "a_Normal")
+        tUv = GLES30.glGetAttribLocation(texturedProgram, "a_Uv")
+        tColor = GLES30.glGetAttribLocation(texturedProgram, "a_Color")
+        tMvp = GLES30.glGetUniformLocation(texturedProgram, "u_Mvp")
+        tLight = GLES30.glGetUniformLocation(texturedProgram, "u_LightDir")
+        tAlpha = GLES30.glGetUniformLocation(texturedProgram, "u_Alpha")
+        tSampler = GLES30.glGetUniformLocation(texturedProgram, "u_Texture")
         // A new GL context has none of the old buffers: upload everything again.
         gpu.clear()
         pendingUpload.addAll(meshes.keys)
+        gpuTextured = null
     }
 
     /** Applies mesh changes published by the reconstruction thread. */
@@ -55,6 +83,13 @@ class MeshRenderer {
                 for (key in gpu.keys.toList()) deleteGpu(key)
                 meshes.clear()
                 pendingUpload.clear()
+                deleteTextured()
+                textured = null
+                continue
+            }
+            if (update.textured != null) {
+                deleteTextured()
+                textured = update.textured
                 continue
             }
             val mesh = update.mesh
@@ -71,6 +106,8 @@ class MeshRenderer {
             val mesh = meshes[key] ?: continue
             upload(key, mesh)
         }
+        val tm = textured
+        if (tm != null && gpuTextured == null) uploadTextured(tm)
         pendingUpload.clear()
         if (changed) updateBounds()
     }
@@ -107,6 +144,91 @@ class MeshRenderer {
         gpu[key] = GpuChunk(vbo, ibo, mesh.indexCount)
     }
 
+    private fun uploadTextured(m: TexturedMesh) {
+        val stride = TEXTURED_STRIDE
+        val vb = ByteBuffer.allocateDirect(m.vertexCount * stride).order(ByteOrder.nativeOrder())
+        for (i in 0 until m.vertexCount) {
+            vb.putFloat(m.positions[i * 3]); vb.putFloat(m.positions[i * 3 + 1]); vb.putFloat(m.positions[i * 3 + 2])
+            vb.putFloat(m.normals[i * 3]); vb.putFloat(m.normals[i * 3 + 1]); vb.putFloat(m.normals[i * 3 + 2])
+            vb.putFloat(m.uvs[i * 2]); vb.putFloat(m.uvs[i * 2 + 1])
+            val c = m.colors[i]
+            vb.put(((c shr 16) and 0xFF).toByte()); vb.put(((c shr 8) and 0xFF).toByte())
+            vb.put((c and 0xFF).toByte()); vb.put(0xFF.toByte())
+        }
+        vb.position(0)
+        val ib = ByteBuffer.allocateDirect(m.indexCount * 4).order(ByteOrder.nativeOrder()).asIntBuffer()
+        ib.put(m.indices)
+        ib.position(0)
+
+        val bitmap = BitmapFactory.decodeByteArray(m.atlasJpeg, 0, m.atlasJpeg.size)
+        if (bitmap == null) {
+            Log.e(TAG, "Could not decode texture atlas")
+            return
+        }
+        val ids = IntArray(2)
+        GLES30.glGenBuffers(2, ids, 0)
+        val tex = IntArray(1)
+        GLES30.glGenTextures(1, tex, 0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex[0])
+        GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, bitmap, 0)
+        bitmap.recycle()
+        GLES30.glGenerateMipmap(GLES30.GL_TEXTURE_2D)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR_MIPMAP_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, ids[0])
+        GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, m.vertexCount * stride, vb, GLES30.GL_STATIC_DRAW)
+        GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, ids[1])
+        GLES30.glBufferData(GLES30.GL_ELEMENT_ARRAY_BUFFER, m.indexCount * 4, ib, GLES30.GL_STATIC_DRAW)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+        GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, 0)
+        gpuTextured = GpuTextured(ids[0], ids[1], tex[0], m.indexCount)
+    }
+
+    private fun deleteTextured() {
+        val g = gpuTextured ?: return
+        GLES30.glDeleteBuffers(2, intArrayOf(g.vbo, g.ibo), 0)
+        GLES30.glDeleteTextures(1, intArrayOf(g.texture), 0)
+        gpuTextured = null
+    }
+
+    private fun drawTextured(g: GpuTextured, mvp: FloatArray, lightDir: FloatArray, alpha: Float) {
+        GLES30.glUseProgram(texturedProgram)
+        GLES30.glUniformMatrix4fv(tMvp, 1, false, mvp, 0)
+        GLES30.glUniform3f(tLight, lightDir[0], lightDir[1], lightDir[2])
+        GLES30.glUniform1f(tAlpha, alpha)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, g.texture)
+        GLES30.glUniform1i(tSampler, 0)
+        if (alpha < 1f) {
+            GLES30.glEnable(GLES30.GL_BLEND)
+            GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        }
+        val stride = TEXTURED_STRIDE
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, g.vbo)
+        GLES30.glVertexAttribPointer(tPosition, 3, GLES30.GL_FLOAT, false, stride, 0)
+        GLES30.glVertexAttribPointer(tNormal, 3, GLES30.GL_FLOAT, false, stride, 12)
+        GLES30.glVertexAttribPointer(tUv, 2, GLES30.GL_FLOAT, false, stride, 24)
+        GLES30.glVertexAttribPointer(tColor, 4, GLES30.GL_UNSIGNED_BYTE, true, stride, 32)
+        GLES30.glEnableVertexAttribArray(tPosition)
+        GLES30.glEnableVertexAttribArray(tNormal)
+        GLES30.glEnableVertexAttribArray(tUv)
+        GLES30.glEnableVertexAttribArray(tColor)
+        GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, g.ibo)
+        GLES30.glDrawElements(GLES30.GL_TRIANGLES, g.indexCount, GLES30.GL_UNSIGNED_INT, 0)
+        GLES30.glDisableVertexAttribArray(tPosition)
+        GLES30.glDisableVertexAttribArray(tNormal)
+        GLES30.glDisableVertexAttribArray(tUv)
+        GLES30.glDisableVertexAttribArray(tColor)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+        GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, 0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+        if (alpha < 1f) GLES30.glDisable(GLES30.GL_BLEND)
+    }
+
     private fun deleteGpu(key: Long) {
         val chunk = gpu.remove(key) ?: return
         GLES30.glDeleteBuffers(2, intArrayOf(chunk.vbo, chunk.ibo), 0)
@@ -126,6 +248,11 @@ class MeshRenderer {
     }
 
     fun draw(mvp: FloatArray, lightDir: FloatArray, style: Style, alpha: Float) {
+        val g = gpuTextured
+        if (style == Style.COLOR && g != null) {
+            drawTextured(g, mvp, lightDir, alpha)
+            return
+        }
         if (gpu.isEmpty()) return
         GLES30.glUseProgram(program)
         GLES30.glUniformMatrix4fv(mvpUniform, 1, false, mvp, 0)
@@ -161,6 +288,41 @@ class MeshRenderer {
     }
 
     companion object {
+        private const val TAG = "MeshRenderer"
+        private const val TEXTURED_STRIDE = 36
+
+        private val TEXTURED_VERTEX_SHADER = """
+            uniform mat4 u_Mvp;
+            attribute vec3 a_Position;
+            attribute vec3 a_Normal;
+            attribute vec2 a_Uv;
+            attribute vec4 a_Color;
+            varying vec3 v_Normal;
+            varying vec2 v_Uv;
+            varying vec4 v_Color;
+            void main() {
+                gl_Position = u_Mvp * vec4(a_Position, 1.0);
+                v_Normal = a_Normal;
+                v_Uv = a_Uv;
+                v_Color = a_Color;
+            }
+        """.trimIndent()
+
+        private val TEXTURED_FRAGMENT_SHADER = """
+            precision mediump float;
+            uniform sampler2D u_Texture;
+            uniform vec3 u_LightDir;
+            uniform float u_Alpha;
+            varying vec3 v_Normal;
+            varying vec2 v_Uv;
+            varying vec4 v_Color;
+            void main() {
+                float diff = abs(dot(normalize(v_Normal), u_LightDir));
+                vec3 c = texture2D(u_Texture, v_Uv).rgb * v_Color.rgb * (0.85 + 0.15 * diff);
+                gl_FragColor = vec4(c, u_Alpha);
+            }
+        """.trimIndent()
+
         private val VERTEX_SHADER = """
             uniform mat4 u_Mvp;
             attribute vec3 a_Position;

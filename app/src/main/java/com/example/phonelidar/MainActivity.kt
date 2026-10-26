@@ -48,7 +48,8 @@ class MainActivity : Activity() {
     private lateinit var styleLabel: TextView
     private lateinit var progressOverlay: View
 
-    private val worker = ReconstructionWorker()
+    private val keyframes = KeyframeCollector()
+    private val worker = ReconstructionWorker(keyframes)
     private val orbit = OrbitCamera()
     private lateinit var renderer: ScanRenderer
 
@@ -86,7 +87,7 @@ class MainActivity : Activity() {
         styleLabel = findViewById(R.id.label_style)
         progressOverlay = findViewById(R.id.progress_overlay)
 
-        renderer = ScanRenderer(worker, orbit, ::displayRotation) { stats ->
+        renderer = ScanRenderer(worker, keyframes, orbit, ::displayRotation) { stats ->
             runOnUiThread { onStats(stats) }
         }
         surfaceView.preserveEGLContextOnPause = true
@@ -124,7 +125,7 @@ class MainActivity : Activity() {
             scanMillis += SystemClock.uptimeMillis() - scanStartedAt
             if ((lastStats?.triangles ?: 0) > 0) {
                 // Replace the live mesh with the cleaned-up model and show it off.
-                beginBusy("Обработка модели…")
+                beginBusy("Обработка модели и текстур…")
                 worker.finalizeModel {
                     runOnUiThread {
                         endBusy()
@@ -175,6 +176,7 @@ class MainActivity : Activity() {
     private fun reset() {
         setScanning(false)
         worker.reset()
+        keyframes.clear()
         scanMillis = 0L
         renderer.reframeRequested = true
         renderer.style = MeshRenderer.Style.NORMALS
@@ -358,11 +360,14 @@ class MainActivity : Activity() {
     private fun export(format: MeshFormat) {
         beginBusy("Сохраняю 3D-модель…")
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val name = "room_$stamp.${format.extension}"
-        worker.withFinalMesh { meshes ->
+        val baseName = "room_$stamp"
+        worker.withFinalModel { model ->
             val result: Result<MediaSaver.Saved> = runCatching {
-                check(meshes.isNotEmpty()) { "Модель пустая" }
-                MediaSaver.save(applicationContext, name) { out -> format.write(out, meshes) }
+                check(model.meshes.isNotEmpty()) { "Модель пустая" }
+                // Several files (OBJ + MTL + JPG) land next to each other; report the main one.
+                format.files(baseName, model)
+                    .map { file -> MediaSaver.save(applicationContext, file.name, file.write) }
+                    .first()
             }
             runOnUiThread {
                 endBusy()
@@ -456,14 +461,19 @@ class MainActivity : Activity() {
     private fun createSession(): Session? {
         val s = Session(this)
 
-        // Prefer a 60 FPS camera stream when the device offers one together with depth.
+        // Prefer 60 FPS, and the sharpest CPU image (up to 1080p) for photo textures, as long
+        // as depth still works with that camera configuration.
         val default = s.cameraConfig
+        fun sharpest(list: List<CameraConfig>) = list
+            .filter { it.imageSize.width <= 1920 }
+            .maxByOrNull { it.imageSize.width * it.imageSize.height }
         val fast = s.getSupportedCameraConfigs(
             CameraConfigFilter(s).setTargetFps(EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_60)),
         )
-        if (fast.isNotEmpty()) {
-            s.setCameraConfig(fast[0])
-            if (pickDepthMode(s) == null) s.setCameraConfig(default)
+        val all = s.getSupportedCameraConfigs(CameraConfigFilter(s))
+        for (candidate in listOfNotNull(sharpest(fast), sharpest(all), default)) {
+            s.setCameraConfig(candidate)
+            if (pickDepthMode(s) != null) break
         }
 
         val depthMode = pickDepthMode(s)
@@ -507,6 +517,7 @@ class MainActivity : Activity() {
         session?.close()
         session = null
         worker.quit()
+        keyframes.shutdown()
         super.onDestroy()
     }
 
