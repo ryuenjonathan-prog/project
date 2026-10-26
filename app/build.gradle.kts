@@ -12,7 +12,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.phonelidar"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 34
         versionCode = buildNumber
         versionName = "1.0.$buildNumber"

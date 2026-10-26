@@ -8,40 +8,31 @@ import java.nio.ByteOrder
 import kotlin.math.abs
 
 /**
- * Turns ARCore raw depth images into colored world-space points.
- *
- * Raw depth is a small (e.g. 160x120) 16-bit image in millimeters with a matching
- * confidence image. Each pixel is unprojected with the camera intrinsics, moved into
- * world space with the camera pose and colored by projecting it into the CPU camera image.
+ * Copies ARCore raw depth (plus confidence and camera color) out of a [Frame] into a
+ * [DepthFrame]. Runs on the GL thread, so it only does cheap per-pixel work.
  */
-class DepthProcessor {
+class DepthCapture {
 
-    var minConfidence = 160
-    var minDepthMeters = 0.2f
-    var maxDepthMeters = 5.0f
+    var minConfidence = 100
+    var minDepthMeters = 0.25f
+    var maxDepthMeters = 4.5f
 
     private var lastDepthTimestamp = 0L
-    private val pose = FloatArray(16)
 
-    fun reset() {
-        lastDepthTimestamp = 0L
-    }
-
-    /** Returns the number of new points added to [cloud]. */
-    fun process(frame: Frame, cloud: PointCloud): Int {
+    /** Returns a new frame, or null if no new depth image is available. */
+    fun capture(frame: Frame): DepthFrame? {
         val depth = try {
             frame.acquireRawDepthImage16Bits()
         } catch (e: NotYetAvailableException) {
-            return 0
+            return null
         }
         depth.use {
-            if (depth.timestamp == lastDepthTimestamp) return 0
+            if (depth.timestamp == lastDepthTimestamp) return null
             lastDepthTimestamp = depth.timestamp
-
             val confidence = try {
                 frame.acquireRawDepthConfidenceImage()
             } catch (e: NotYetAvailableException) {
-                return 0
+                return null
             }
             confidence.use {
                 val color = try {
@@ -50,7 +41,7 @@ class DepthProcessor {
                     null
                 }
                 try {
-                    return unproject(frame, depth, confidence, color, cloud)
+                    return convert(frame, depth, confidence, color)
                 } finally {
                     color?.close()
                 }
@@ -58,85 +49,50 @@ class DepthProcessor {
         }
     }
 
-    private fun unproject(
-        frame: Frame,
-        depth: Image,
-        confidence: Image,
-        color: Image?,
-        cloud: PointCloud,
-    ): Int {
+    private fun convert(frame: Frame, depth: Image, confidence: Image, color: Image?): DepthFrame {
         val camera = frame.camera
-        val depthW = depth.width
-        val depthH = depth.height
+        val w = depth.width
+        val h = depth.height
 
         // Depth is aligned with either the GPU texture or the CPU image depending on the
         // device; use whichever intrinsics share the depth image's aspect ratio.
-        val depthIntr = pickIntrinsics(
-            depthW, depthH, camera.textureIntrinsics, camera.imageIntrinsics,
-        )
-        val dDims = depthIntr.imageDimensions
-        val dFocal = depthIntr.focalLength
-        val dPp = depthIntr.principalPoint
-        val fx = dFocal[0] * depthW / dDims[0]
-        val fy = dFocal[1] * depthH / dDims[1]
-        val cx = dPp[0] * depthW / dDims[0]
-        val cy = dPp[1] * depthH / dDims[1]
+        val intr = pickIntrinsics(w, h, camera.textureIntrinsics, camera.imageIntrinsics)
+        val dims = intr.imageDimensions
+        val focal = intr.focalLength
+        val pp = intr.principalPoint
+        val fx = focal[0] * w / dims[0]
+        val fy = focal[1] * h / dims[1]
+        val cx = pp[0] * w / dims[0]
+        val cy = pp[1] * h / dims[1]
 
-        // Pose of the physical camera (sensor-aligned, OpenGL convention: -Z forward, +Y up).
+        val pose = FloatArray(16)
         camera.pose.toMatrix(pose, 0)
 
         val depthPlane = depth.planes[0]
         val depthBuf = depthPlane.buffer.order(ByteOrder.LITTLE_ENDIAN)
-        val depthRowStride = depthPlane.rowStride
-        val depthPixelStride = depthPlane.pixelStride
-
         val confPlane = confidence.planes[0]
         val confBuf = confPlane.buffer
-        val confRowStride = confPlane.rowStride
-        val confPixelStride = confPlane.pixelStride
+        val sampler = color?.let { ColorSampler(it, camera.imageIntrinsics) }
 
-        val colorSampler = color?.let { ColorSampler(it, camera.imageIntrinsics) }
-
-        var added = 0
-        for (v in 0 until depthH) {
-            for (u in 0 until depthW) {
-                val conf = confBuf.get(v * confRowStride + u * confPixelStride).toInt() and 0xFF
+        val meters = FloatArray(w * h)
+        val colors = IntArray(w * h)
+        for (v in 0 until h) {
+            for (u in 0 until w) {
+                val conf = confBuf.get(v * confPlane.rowStride + u * confPlane.pixelStride).toInt() and 0xFF
                 if (conf < minConfidence) continue
-                val mm = depthBuf.getShort(v * depthRowStride + u * depthPixelStride)
+                val mm = depthBuf.getShort(v * depthPlane.rowStride + u * depthPlane.pixelStride)
                     .toInt() and 0xFFFF
-                if (mm == 0) continue
                 val d = mm * 0.001f
                 if (d < minDepthMeters || d > maxDepthMeters) continue
-
-                // Sensor frame (x right, y down, z forward) -> OpenGL camera frame.
-                val xs = (u - cx) * d / fx
-                val ys = (v - cy) * d / fy
-                val px = xs
-                val py = -ys
-                val pz = -d
-
-                val wx = pose[0] * px + pose[4] * py + pose[8] * pz + pose[12]
-                val wy = pose[1] * px + pose[5] * py + pose[9] * pz + pose[13]
-                val wz = pose[2] * px + pose[6] * py + pose[10] * pz + pose[14]
-
-                val rgb = colorSampler?.sample(xs, ys, d) ?: DEFAULT_COLOR
-                val r = ((rgb shr 16) and 0xFF) / 255f
-                val g = ((rgb shr 8) and 0xFF) / 255f
-                val b = (rgb and 0xFF) / 255f
-
-                if (cloud.add(wx, wy, wz, r, g, b)) added++
-                if (cloud.isFull) return added
+                val i = v * w + u
+                meters[i] = d
+                colors[i] = sampler?.sample((u - cx) * d / fx, (v - cy) * d / fy, d) ?: DEFAULT_COLOR
             }
         }
-        return added
+        return DepthFrame(w, h, meters, colors, fx, fy, cx, cy, pose)
     }
 
-    private fun pickIntrinsics(
-        w: Int,
-        h: Int,
-        a: CameraIntrinsics,
-        b: CameraIntrinsics,
-    ): CameraIntrinsics {
+    private fun pickIntrinsics(w: Int, h: Int, a: CameraIntrinsics, b: CameraIntrinsics): CameraIntrinsics {
         val aspect = w.toFloat() / h
         val ad = a.imageDimensions
         val bd = b.imageDimensions
@@ -178,10 +134,8 @@ class DepthProcessor {
             val y = yBuf.get(v * yPlane.rowStride + u * yPlane.pixelStride).toInt() and 0xFF
             val uvRow = v / 2
             val uvCol = u / 2
-            val cu = (uBuf.get(uvRow * uPlane.rowStride + uvCol * uPlane.pixelStride)
-                .toInt() and 0xFF) - 128
-            val cv = (vBuf.get(uvRow * vPlane.rowStride + uvCol * vPlane.pixelStride)
-                .toInt() and 0xFF) - 128
+            val cu = (uBuf.get(uvRow * uPlane.rowStride + uvCol * uPlane.pixelStride).toInt() and 0xFF) - 128
+            val cv = (vBuf.get(uvRow * vPlane.rowStride + uvCol * vPlane.pixelStride).toInt() and 0xFF) - 128
 
             val r = clamp(y + 1.402f * cv)
             val g = clamp(y - 0.344136f * cu - 0.714136f * cv)
@@ -193,6 +147,6 @@ class DepthProcessor {
     }
 
     companion object {
-        private const val DEFAULT_COLOR = 0x00C8FF
+        private const val DEFAULT_COLOR = 0x9A9A9A
     }
 }
