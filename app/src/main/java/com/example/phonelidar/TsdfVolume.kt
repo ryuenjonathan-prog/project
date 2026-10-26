@@ -245,15 +245,26 @@ class TsdfVolume(
     private val col = IntList()
     private val idx = IntList()
 
+    private val snappedFlags = BoolList()
+    private val vp = FloatArray(3)
+    private val vn = FloatArray(3)
+
+    /** Every chunk that contains at least one allocated block. */
+    fun allChunkKeys(): LongArray {
+        val keys = HashSet<Long>()
+        for (key in blocks.keys) keys.add(pack(unpackX(key) shr 2, unpackY(key) shr 2, unpackZ(key) shr 2))
+        return keys.toLongArray()
+    }
+
     /** Builds the mesh of one chunk, or null if it contains no surface. */
-    fun meshChunk(key: Long): ChunkMesh? {
+    fun meshChunk(key: Long, planes: PlaneSet = PlaneSet.EMPTY): ChunkMesh? {
         val baseX = unpackX(key) * CHUNK_VOXELS - 1
         val baseY = unpackY(key) * CHUNK_VOXELS - 1
         val baseZ = unpackZ(key) * CHUNK_VOXELS - 1
         if (!gather(baseX - BORDER, baseY - BORDER, baseZ - BORDER)) return null
         smooth()
 
-        pos.clear(); nrm.clear(); col.clear(); idx.clear()
+        pos.clear(); nrm.clear(); col.clear(); idx.clear(); snappedFlags.clear()
         val vs = voxelSize
         val minW = minMeshWeight
         val sx = 1
@@ -313,11 +324,15 @@ class TsdfVolume(
                         wsum += wc
                     }
 
+                    vp[0] = (baseX + i + ox + 0.5f) * vs
+                    vp[1] = (baseY + j + oy + 0.5f) * vs
+                    vp[2] = (baseZ + k + oz + 0.5f) * vs
+                    vn[0] = gx; vn[1] = gy; vn[2] = gz
+                    snappedFlags.add(!planes.isEmpty && planes.snap(vp, vn))
+
                     cellVertex[ci] = pos.size / 3
-                    pos.add((baseX + i + ox + 0.5f) * vs)
-                    pos.add((baseY + j + oy + 0.5f) * vs)
-                    pos.add((baseZ + k + oz + 0.5f) * vs)
-                    nrm.add(gx); nrm.add(gy); nrm.add(gz)
+                    pos.add(vp[0]); pos.add(vp[1]); pos.add(vp[2])
+                    nrm.add(vn[0]); nrm.add(vn[1]); nrm.add(vn[2])
                     col.add(
                         ((r / wsum).toInt() shl 16) or ((g / wsum).toInt() shl 8) or (bl / wsum).toInt(),
                     )
@@ -488,7 +503,7 @@ class TsdfVolume(
         val ib = ByteBuffer.allocateDirect(idx.size * 4).order(ByteOrder.nativeOrder()).asIntBuffer()
         ib.put(idx.data, 0, idx.size)
         ib.position(0)
-        return ChunkMesh(key, vertexCount, idx.size, vb, ib, area, min, max)
+        return ChunkMesh(key, vertexCount, idx.size, vb, ib, area, min, max, snappedFlags.toArray())
     }
 
     private class FloatList {
@@ -499,6 +514,17 @@ class TsdfVolume(
             if (size == data.size) data = data.copyOf(size * 2)
             data[size++] = value
         }
+    }
+
+    private class BoolList {
+        var data = BooleanArray(4096)
+        var size = 0
+        fun clear() { size = 0 }
+        fun add(value: Boolean) {
+            if (size == data.size) data = data.copyOf(size * 2)
+            data[size++] = value
+        }
+        fun toArray(): BooleanArray = data.copyOf(size)
     }
 
     private class IntList {

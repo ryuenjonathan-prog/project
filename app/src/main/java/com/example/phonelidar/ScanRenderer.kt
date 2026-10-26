@@ -5,6 +5,7 @@ import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.os.SystemClock
 import android.util.Log
+import com.google.ar.core.Plane
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
@@ -58,6 +59,7 @@ class ScanRenderer(
     private var fpsWindowStart = 0L
     private var cameraFps = 0
     private var lastStatsTime = 0L
+    private var lastPlanesTime = 0L
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES30.glEnable(GLES30.GL_DEPTH_TEST)
@@ -117,6 +119,11 @@ class ScanRenderer(
             }
         }
 
+        if (tracking && SystemClock.uptimeMillis() - lastPlanesTime > PLANES_INTERVAL_MS) {
+            lastPlanesTime = SystemClock.uptimeMillis()
+            worker.planes = collectPlanes(session)
+        }
+
         background.draw(frame, visible = !show3d)
         if (show3d) {
             drawOrbit()
@@ -139,6 +146,28 @@ class ScanRenderer(
                 ),
             )
         }
+    }
+
+    private fun collectPlanes(session: Session): PlaneSet {
+        val planes = ArrayList<SnapPlane>()
+        for (plane in session.getAllTrackables(Plane::class.java)) {
+            if (plane.trackingState != TrackingState.TRACKING || plane.subsumedBy != null) continue
+            val polygonBuffer = plane.polygon
+            val polygon = FloatArray(polygonBuffer.remaining())
+            polygonBuffer.get(polygon)
+            if (polygon.size < 6) continue
+            val pose = plane.centerPose
+            planes.add(
+                SnapPlane(
+                    center = floatArrayOf(pose.tx(), pose.ty(), pose.tz()),
+                    normal = pose.yAxis,
+                    axisX = pose.xAxis,
+                    axisZ = pose.zAxis,
+                    polygon = polygon,
+                ),
+            )
+        }
+        return PlaneSet(planes)
     }
 
     private fun drawOrbit() {
@@ -166,5 +195,6 @@ class ScanRenderer(
     companion object {
         private const val TAG = "ScanRenderer"
         private const val OVERLAY_ALPHA = 0.6f
+        private const val PLANES_INTERVAL_MS = 500L
     }
 }

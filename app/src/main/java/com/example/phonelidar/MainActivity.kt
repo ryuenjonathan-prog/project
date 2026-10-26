@@ -122,11 +122,18 @@ class MainActivity : Activity() {
             if (view3d) setView3d(false)
         } else {
             scanMillis += SystemClock.uptimeMillis() - scanStartedAt
-            worker.flush()
-            // Show off the result right away.
             if ((lastStats?.triangles ?: 0) > 0) {
-                renderer.reframeRequested = true
-                setView3d(true)
+                // Replace the live mesh with the cleaned-up model and show it off.
+                beginBusy("Обработка модели…")
+                worker.finalizeModel {
+                    runOnUiThread {
+                        endBusy()
+                        if (!scanning) {
+                            renderer.reframeRequested = true
+                            setView3d(true)
+                        }
+                    }
+                }
             }
         }
         refreshUi()
@@ -257,6 +264,19 @@ class MainActivity : Activity() {
         else -> n.toString()
     }
 
+    private var busyCount = 0
+
+    private fun beginBusy(text: String) {
+        busyCount++
+        findViewById<TextView>(R.id.progress_text).text = text
+        progressOverlay.visibility = View.VISIBLE
+    }
+
+    private fun endBusy() {
+        busyCount = (busyCount - 1).coerceAtLeast(0)
+        if (busyCount == 0) progressOverlay.visibility = View.GONE
+    }
+
     private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
 
     // ---- Gestures (3D view) ----
@@ -336,7 +356,7 @@ class MainActivity : Activity() {
     }
 
     private fun export(format: MeshFormat) {
-        progressOverlay.visibility = View.VISIBLE
+        beginBusy("Сохраняю 3D-модель…")
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val name = "room_$stamp.${format.extension}"
         worker.withFinalMesh { meshes ->
@@ -345,7 +365,7 @@ class MainActivity : Activity() {
                 MediaSaver.save(applicationContext, name) { out -> format.write(out, meshes) }
             }
             runOnUiThread {
-                progressOverlay.visibility = View.GONE
+                endBusy()
                 result.fold(
                     onSuccess = { showSaved(it, format) },
                     onFailure = {
@@ -458,7 +478,7 @@ class MainActivity : Activity() {
         config.setDepthMode(depthMode)
         renderer.useFullDepth = depthMode == Config.DepthMode.AUTOMATIC
         config.setFocusMode(Config.FocusMode.AUTO)
-        config.setPlaneFindingMode(Config.PlaneFindingMode.DISABLED)
+        config.setPlaneFindingMode(Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL)
         config.setLightEstimationMode(Config.LightEstimationMode.DISABLED)
         config.setUpdateMode(Config.UpdateMode.LATEST_CAMERA_IMAGE)
         s.configure(config)

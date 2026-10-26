@@ -18,6 +18,8 @@ class ChunkMesh(
     val area: Float,
     val min: FloatArray,
     val max: FloatArray,
+    /** Vertices that were snapped onto a detected plane; post-processing keeps them fixed. */
+    val snapped: BooleanArray,
 ) {
     companion object {
         const val STRIDE = 28
